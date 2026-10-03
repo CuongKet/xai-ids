@@ -1,0 +1,30 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# Pickled datasets & intermediate outputs
+*.pkl
+
+# Generated plots
+*.png
+
+# Checkpoints / IDE
+.ipynb_checkpoints/
+.vscode/
+.idea/
+
+# Legacy monolithic benchmark suites (to be refactored into Framework)
+CICIDS-2017/
+RoEduNet-SIMARGL2021/
+NSL-KDD/
+Xplique/
+images/
