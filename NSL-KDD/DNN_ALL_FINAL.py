@@ -310,8 +310,8 @@ multi_label_test = pd.DataFrame(multi_data_test.label)
 
 
 # using standard scaler for normalizing
-#std_scaler = StandardScaler()
-#def standardization(df,col):
+std_scaler = StandardScaler()
+def standardization(df,col):
     for i in col:
         arr = df[i]
         arr = np.array(arr)

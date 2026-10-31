@@ -13,6 +13,10 @@ venv/
 
 # Pickled datasets & intermediate outputs
 *.pkl
+*.npz
+*.html
+Framework/outputs/
+Framework/KDDTrain+.txt
 
 # Generated plots
 *.png
@@ -22,3 +26,10 @@ venv/
 .ipynb_checkpoints/
 .vscode/
 .idea/
+
+# Large local datasets
+Framework/cicids-2017/
+Framework/kdd/
+Framework/sigma/
+cicids_db/
+sensor_db/
