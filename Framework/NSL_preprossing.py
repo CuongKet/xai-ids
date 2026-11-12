@@ -13,6 +13,9 @@ Fixes applied from audit:
       (or optional --no-oversample to rely purely on model class_weight).
 - B12: Saves both integer class labels (Y_train.pkl, Y_test.pkl) and one-hot matrices
        (Y_train_bin.pkl, Y_test_bin.pkl) to Framework/ directory.
+- V1: Carves a stratified validation split out of KDDTrain+ BEFORE fitting encoders/scaler
+      and BEFORE oversampling (X_val.pkl, Y_val.pkl), so early stopping / model selection never
+      touches KDDTest+ and never sees oversampled duplicates of training rows.
 """
 
 import argparse
@@ -24,6 +27,7 @@ from collections import Counter
 import numpy as np
 import pandas as pd
 from imblearn.over_sampling import RandomOverSampler
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelBinarizer, OneHotEncoder, StandardScaler
 
 SEED = 42
@@ -73,6 +77,7 @@ def preprocess_nsl_kdd(
     test_path: str,
     output_dir: str,
     oversample_mode: str = "capped",
+    val_size: float = 0.1,
     seed: int = SEED,
 ):
     set_seed(seed)
@@ -107,6 +112,13 @@ def preprocess_nsl_kdd(
     X_train_raw = df_train.drop(["label"], axis=1)
     X_test_raw = df_test.drop(["label"], axis=1)
 
+    # Stratified validation split from KDDTrain+ (before any fitting or oversampling)
+    X_train_raw, X_val_raw, y_train, y_val = train_test_split(
+        X_train_raw, y_train, test_size=val_size, stratify=y_train, random_state=seed
+    )
+    X_train_raw = X_train_raw.reset_index(drop=True)
+    X_val_raw = X_val_raw.reset_index(drop=True)
+
     numeric_columns = [c for c in X_train_raw.columns if c not in CATEGORICAL_COLUMNS]
 
     # Fit OneHotEncoder on training categorical columns ONLY (handle_unknown='ignore' prevents test crash/leakage)
@@ -116,6 +128,7 @@ def preprocess_nsl_kdd(
         ohe = OneHotEncoder(handle_unknown="ignore", sparse=False, dtype=np.float64)
 
     X_train_cat = ohe.fit_transform(X_train_raw[CATEGORICAL_COLUMNS])
+    X_val_cat = ohe.transform(X_val_raw[CATEGORICAL_COLUMNS])
     X_test_cat = ohe.transform(X_test_raw[CATEGORICAL_COLUMNS])
 
     cat_feature_names = []
@@ -126,6 +139,7 @@ def preprocess_nsl_kdd(
     # Fit StandardScaler on training numeric columns ONLY
     scaler = StandardScaler()
     X_train_num = scaler.fit_transform(X_train_raw[numeric_columns].astype(np.float64))
+    X_val_num = scaler.transform(X_val_raw[numeric_columns].astype(np.float64))
     X_test_num = scaler.transform(X_test_raw[numeric_columns].astype(np.float64))
 
     all_columns = numeric_columns + cat_feature_names
@@ -133,14 +147,17 @@ def preprocess_nsl_kdd(
         np.hstack([X_train_num, X_train_cat]),
         columns=all_columns,
     )
+    X_val = pd.DataFrame(np.hstack([X_val_num, X_val_cat]), columns=all_columns)
     X_test = pd.DataFrame(
         np.hstack([X_test_num, X_test_cat]),
         columns=all_columns,
     )
 
     print("Processed X_train shape:", X_train.shape)
+    print("Processed X_val shape:", X_val.shape)
     print("Processed X_test shape:", X_test.shape)
     print("Raw training class distribution:", dict(sorted(Counter(y_train).items())))
+    print("Validation class distribution:", dict(sorted(Counter(y_val).items())))
     print("Test class distribution:", dict(sorted(Counter(y_test).items())))
 
     # Handle class imbalance on training split only
@@ -168,8 +185,10 @@ def preprocess_nsl_kdd(
     os.makedirs(output_dir, exist_ok=True)
     artifacts = {
         "X_train.pkl": X_train,
+        "X_val.pkl": X_val,
         "X_test.pkl": X_test,
         "Y_train.pkl": y_train,
+        "Y_val.pkl": y_val,
         "Y_test.pkl": y_test,
         "Y_train_bin.pkl": Y_train_bin,
         "Y_test_bin.pkl": Y_test_bin,
@@ -193,6 +212,12 @@ if __name__ == "__main__":
         default="capped",
         help="Training oversampling mode (default: capped).",
     )
+    parser.add_argument(
+        "--val-size",
+        type=float,
+        default=0.1,
+        help="Fraction of KDDTrain+ held out (stratified) as a validation set (default: 0.1).",
+    )
     parser.add_argument("--seed", type=int, default=SEED)
     args = parser.parse_args()
 
@@ -201,5 +226,6 @@ if __name__ == "__main__":
         test_path=args.test_file,
         output_dir=args.output_dir,
         oversample_mode=args.oversample,
+        val_size=args.val_size,
         seed=args.seed,
     )

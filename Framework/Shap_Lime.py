@@ -2,7 +2,7 @@
 Explainable AI (SHAP & LIME) utilities for NIDS models.
 
 Fixes applied from audit:
-- D1/D2: Dispatches TreeExplainer for tree models (RandomForest, LightGBM),
+- D1/D2: Dispatches TreeExplainer for RandomForest/ExtraTrees,
          GradientExplainer/DeepExplainer or probability-based KernelExplainer with
          k-means background summary (k=20) and bounded nsamples for non-tree models.
 - D3/D4: Always explains continuous class probabilities (predict_proba) instead of
@@ -13,8 +13,16 @@ Fixes applied from audit:
 - D6: Uses seeded stratified sampling for explanation subsets.
 - D7: Computes SHAP values once and caches/returns them for reuse across bar, beeswarm,
       and waterfall plots; saves all figures to disk instead of failing in headless mode.
+- E1: Cache files are keyed by a fingerprint of the model (its probabilities on X_eval), the
+      evaluation rows and the explainer settings, so stale explanations are never reloaded.
+- E2: The SHAP evaluation set always contains the LIME row, and both use X_test index labels,
+      so local SHAP and LIME plots for "row N" explain the same instance.
+- E3: All SHAP values are in probability space (LightGBM uses KernelExplainer on predict_proba
+      instead of log-odds TreeExplainer output); an additivity check verifies this at runtime.
 """
 
+import hashlib
+import json
 import os
 import time
 from typing import Callable, List, Optional, Tuple
@@ -135,6 +143,24 @@ def _normalize_shap_values(raw_shap_values, n_samples: int, n_features: int) -> 
     raise ValueError(f"Unexpected SHAP values shape: {arr.shape}")
 
 
+TREE_EXPLAINER_MODELS = ("RandomForestClassifier", "ExtraTreesClassifier")
+
+
+def _cache_key(model, X_eval: pd.DataFrame, settings: dict) -> str:
+    """
+    Fingerprint everything the SHAP values depend on: explainer settings, the exact evaluation rows
+    (values + test-set indices) and the trained model itself (via its probabilities on X_eval), so a
+    retrained model, new preprocessing, different seed or sample count never reuses a stale cache.
+    """
+    h = hashlib.sha256()
+    h.update(json.dumps(settings, sort_keys=True).encode())
+    h.update(np.ascontiguousarray(X_eval.to_numpy(dtype=np.float64)).tobytes())
+    h.update(np.asarray(X_eval.index).astype(np.int64).tobytes())
+    proba = get_probability_fn(model)(X_eval)
+    h.update(np.round(proba, 6).astype(np.float64).tobytes())
+    return h.hexdigest()[:16]
+
+
 def compute_shap_explanations(
     model,
     X_train: pd.DataFrame,
@@ -145,37 +171,67 @@ def compute_shap_explanations(
     nsamples: int = 300,
     seed: int = 42,
     cache_path: Optional[str] = None,
+    include_index=None,
 ) -> Tuple[List[np.ndarray], np.ndarray, pd.DataFrame]:
     """
-    Compute or load cached multi-class SHAP values using the fastest accurate explainer
-    for the given model type.
+    Compute or load cached multi-class SHAP values, always in PROBABILITY space so attributions
+    are comparable across all models.
+
+    - RandomForest / ExtraTrees: TreeExplainer (interventional); raw tree output is already the
+      class probability, verified by an additivity check against predict_proba.
+    - All other models (incl. LightGBM, whose raw TreeExplainer output is log-odds and whose
+      multi-class model_output="probability" is not additive in SHAP 0.46): KernelExplainer on
+      predict_proba with a k-means background.
+
+    Args:
+        include_index: test-set index label that must be part of X_eval (so local SHAP and LIME
+            explain the same instance).
+        cache_path: cache file prefix; the actual file is `<prefix>_<fingerprint>.npz`.
 
     Returns:
         shap_list: list of (n_eval, n_features) arrays per class
         expected_values: 1D array of base values per class
-        X_eval: DataFrame of evaluated test instances
+        X_eval: DataFrame of evaluated test instances (index = original X_test index labels)
     """
     X_eval = stratified_sample(X_test, y=y_test, n_samples=max_samples, seed=seed)
-
-    if cache_path and os.path.exists(cache_path):
-        data = np.load(cache_path, allow_pickle=True)
-        shap_arr = data["shap_values"]
-        expected_values = data["expected_values"]
-        X_cached = pd.DataFrame(data["X_eval"], columns=X_test.columns)
-        return [shap_arr[c] for c in range(shap_arr.shape[0])], expected_values, X_cached
+    if include_index is not None and include_index not in X_eval.index:
+        X_eval = pd.concat([X_eval, X_test.loc[[include_index]]])
 
     model_cls = model.__class__.__name__
-    start = time.time()
+    use_tree = model_cls in TREE_EXPLAINER_MODELS
+    settings = {
+        "model_cls": model_cls,
+        "explainer": "tree_interventional" if use_tree else "kernel",
+        "background_k": background_k,
+        "nsamples": nsamples,
+        "seed": seed,
+        "output_space": "probability",
+        "shap_version": shap.__version__,
+    }
 
-    if model_cls in ("RandomForestClassifier", "LGBMClassifier", "ExtraTreesClassifier"):
-        print(f"[SHAP] Using fast TreeExplainer for {model_cls} on {len(X_eval)} samples...")
+    resolved_cache = None
+    if cache_path:
+        key = _cache_key(model, X_eval, settings)
+        stem = cache_path[:-4] if cache_path.endswith(".npz") else cache_path
+        resolved_cache = f"{stem}_{key}.npz"
+        if os.path.exists(resolved_cache):
+            data = np.load(resolved_cache, allow_pickle=False)
+            if str(data["cache_key"]) == key:
+                print(f"[SHAP] Loaded cached explanations from {resolved_cache}")
+                shap_arr = data["shap_values"]
+                X_cached = pd.DataFrame(data["X_eval"], columns=X_test.columns, index=data["eval_index"])
+                return [shap_arr[c] for c in range(shap_arr.shape[0])], data["expected_values"], X_cached
+
+    start = time.time()
+    if use_tree:
+        print(f"[SHAP] Using TreeExplainer (interventional, probability output) for {model_cls} on {len(X_eval)} samples...")
         bg = X_train.sample(n=min(100, len(X_train)), random_state=seed)
-        explainer = shap.TreeExplainer(model, data=bg)
+        explainer = shap.TreeExplainer(model, data=bg, feature_perturbation="interventional")
         raw_vals = explainer.shap_values(X_eval, check_additivity=False)
         expected_values = np.atleast_1d(explainer.expected_value)
     else:
         print(
-            f"[SHAP] Using KernelExplainer (kmeans={background_k}, nsamples={nsamples}) "
+            f"[SHAP] Using KernelExplainer on predict_proba (kmeans={background_k}, nsamples={nsamples}) "
             f"for {model_cls} on {len(X_eval)} samples..."
         )
         bg_sample = X_train.sample(n=min(2000, len(X_train)), random_state=seed)
@@ -189,14 +245,26 @@ def compute_shap_explanations(
     elapsed = time.time() - start
     print(f"[SHAP] Completed in {elapsed:.2f}s.")
 
-    if cache_path:
-        os.makedirs(os.path.dirname(os.path.abspath(cache_path)), exist_ok=True)
+    # Sanity check: attributions must reconstruct the predicted probabilities
+    if len(shap_list) == len(expected_values):
+        recon = np.stack([shap_list[c].sum(axis=1) + expected_values[c] for c in range(len(shap_list))], axis=1)
+        proba = get_probability_fn(model)(X_eval)
+        if recon.shape == proba.shape:
+            err = float(np.abs(recon - proba).max())
+            flag = "OK" if err < 1e-2 else "WARNING: SHAP values do not sum to predict_proba"
+            print(f"[SHAP] Additivity check (max |sum(SHAP)+base - proba|) = {err:.2e} -> {flag}")
+
+    if resolved_cache:
+        os.makedirs(os.path.dirname(os.path.abspath(resolved_cache)), exist_ok=True)
         np.savez_compressed(
-            cache_path,
+            resolved_cache,
             shap_values=np.stack(shap_list, axis=0),
             expected_values=expected_values,
             X_eval=X_eval.to_numpy(),
+            eval_index=np.asarray(X_eval.index),
+            cache_key=np.array(key),
         )
+        print(f"[SHAP] Cached explanations to {resolved_cache}")
     return shap_list, expected_values, X_eval
 
 
@@ -253,32 +321,38 @@ def shap_waterfallplot(
     model,
     X_train: pd.DataFrame,
     X_test: pd.DataFrame,
-    instance_index: int = 0,
+    instance_index=0,
     class_index: int = 0,
     class_names: List[str] = DEFAULT_CLASS_NAMES,
     output_path: str = "shap_waterfall.png",
     precomputed: Optional[Tuple[List[np.ndarray], np.ndarray, pd.DataFrame]] = None,
 ):
+    """Waterfall for the test row whose X_test index label is `instance_index` (same row LIME explains)."""
     shap_list, expected_values, X_eval = precomputed or compute_shap_explanations(
-        model, X_train, X_test, max_samples=max(20, instance_index + 1)
+        model, X_train, X_test, include_index=instance_index
     )
+    if instance_index not in X_eval.index:
+        raise ValueError(
+            f"Test row {instance_index} is not in the SHAP evaluation set; pass include_index={instance_index} "
+            "to compute_shap_explanations."
+        )
     cls_idx = min(class_index, len(shap_list) - 1)
-    inst_idx = min(instance_index, len(X_eval) - 1)
+    pos = X_eval.index.get_loc(instance_index)
     base_val = float(expected_values[cls_idx]) if len(expected_values) > cls_idx else float(expected_values[0])
 
     explanation = shap.Explanation(
-        values=shap_list[cls_idx][inst_idx],
+        values=shap_list[cls_idx][pos],
         base_values=base_val,
-        data=X_eval.iloc[inst_idx].to_numpy(),
+        data=X_eval.iloc[pos].to_numpy(),
         feature_names=X_eval.columns.tolist(),
     )
     plt.figure(figsize=(10, 6))
     shap.waterfall_plot(explanation, show=False)
-    plt.title(f"SHAP Waterfall - Instance {inst_idx} ({class_names[cls_idx]})")
+    plt.title(f"SHAP Waterfall - Test row {instance_index} ({class_names[cls_idx]})")
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close()
-    print(f"[SHAP] Saved waterfall plot to {output_path}")
+    print(f"[SHAP] Saved waterfall plot (test row {instance_index}) to {output_path}")
 
 
 def lime_plot(
@@ -305,7 +379,7 @@ def lime_plot(
         random_state=seed,
     )
     proba_fn = get_probability_fn(model)
-    instance = X_test.iloc[row_index].to_numpy()
+    instance = X_test.loc[row_index].to_numpy()  # index label: same row as the SHAP waterfall
     pred_probs = proba_fn(instance)[0]
     top_label = int(np.argmax(pred_probs))
 
@@ -318,7 +392,7 @@ def lime_plot(
     )
     exp.save_to_file(output_html)
     fig = exp.as_pyplot_figure(label=top_label)
-    fig.suptitle(f"LIME Explanation - Row {row_index} (Predicted: {class_names[top_label]})")
+    fig.suptitle(f"LIME Explanation - Test row {row_index} (Predicted: {class_names[top_label]})")
     fig.tight_layout()
     fig.savefig(output_png, dpi=150, bbox_inches="tight")
     plt.close(fig)
