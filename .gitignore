@@ -33,3 +33,8 @@ Framework/kdd/
 Framework/sigma/
 cicids_db/
 sensor_db/
+
+# Generated preprocessed splits / run outputs for the CICIDS & SIMARGL suites
+CICIDS-2017/data/
+RoEduNet-SIMARGL2021/data/
+Framework/meta.json

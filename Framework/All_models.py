@@ -16,6 +16,8 @@ Fixes applied from audit:
       KDDTest+ and never oversampled duplicates (MLP, DNN and LightGBM).
 - R3: "svm" is a real linear SVM (LinearSVC + sigmoid calibration for probabilities); the former
       SGD log-loss model is kept as "logreg" (it is logistic regression).
+- R5: Dataset-agnostic: class names come from <data-dir>/meta.json, so the same runner trains and explains
+      NSL-KDD, CICIDS-2017 and RoEduNet-SIMARGL2021 (see each suite's *_preprocessing.py).
 - R4: Every run saves the trained model, validation + test metrics (JSON), test probabilities, and appends to
       outputs/results.csv; --seeds runs several seeds and writes a mean ± std summary.
 """
@@ -45,6 +47,7 @@ from sklearn.metrics import (
 from sklearn.preprocessing import LabelBinarizer
 
 SEED = 42
+# Default (NSL-KDD) class names; replaced at runtime by `class_names` from <data-dir>/meta.json if present.
 CLASS_NAMES = ["Normal", "DoS", "Probe", "R2L", "U2R"]
 
 MODEL_REGISTRY = {
@@ -109,12 +112,25 @@ def MCC(TP, TN, FP, FN):
     return (TN * TP - FN * FP) / (((TP + FP + eps) * (TP + FN + eps) * (TN + FP + eps) * (TN + FN + eps)) ** 0.5)
 
 
+def load_class_names(data_dir: str):
+    meta_path = os.path.join(data_dir, "meta.json")
+    if os.path.exists(meta_path):
+        with open(meta_path) as f:
+            meta = json.load(f)
+        print(f"Dataset: {meta.get('dataset', '?')} | feature set: {meta.get('feature_set', '-')} | classes: {meta['class_names']}")
+        return list(meta["class_names"])
+    print("No meta.json found; assuming NSL-KDD classes.")
+    return ["Normal", "DoS", "Probe", "R2L", "U2R"]
+
+
 def load_artifacts(data_dir: str):
     def load(filename):
         path = os.path.join(data_dir, filename)
         if not os.path.exists(path):
             raise FileNotFoundError(
-                f"Missing preprocessed file {path}. Run `python Framework/NSL_preprossing.py` first "
+                f"Missing preprocessed file {path}. Run the dataset's preprocessing script first "
+                "(Framework/NSL_preprossing.py, CICIDS-2017/cicids_preprocessing.py or "
+                "RoEduNet-SIMARGL2021/simargl_preprocessing.py) "
                 "(re-run it if X_val.pkl / Y_val.pkl are missing: they were added with the validation split)."
             )
         with open(path, "rb") as f:
@@ -448,11 +464,11 @@ def main():
         "'all' runs the 7 benchmark models (excludes logreg).",
     )
     parser.add_argument("--data-dir", type=str, default=base_dir, help="Directory with preprocessed .pkl files.")
-    parser.add_argument("--output-dir", type=str, default=os.path.join(base_dir, "outputs"))
+    parser.add_argument("--output-dir", type=str, default=None, help="Default: <data-dir>/outputs")
     parser.add_argument("--explain", action="store_true", help="Run SHAP and LIME explanations (first seed only).")
     parser.add_argument("--shap-samples", type=int, default=100, help="Number of stratified test samples for SHAP.")
     parser.add_argument("--row-index", type=int, default=0, help="Test row for local Waterfall/LIME plots (same row for both).")
-    parser.add_argument("--class-index", type=int, default=1, help="Target class index (0..4) for beeswarm/waterfall.")
+    parser.add_argument("--class-index", type=int, default=1, help="Target class index for beeswarm/waterfall (see meta.json class_names).")
     parser.add_argument("--seed", type=int, default=SEED, help="Single seed (ignored if --seeds is given).")
     parser.add_argument("--seeds", type=int, nargs="+", default=None, help="Run each model for several seeds, e.g. --seeds 42 43 44 45 46.")
     parser.add_argument("--max-epochs", type=int, default=200, help="Max epochs for MLP/DNN (early stopping on validation).")
@@ -462,6 +478,13 @@ def main():
     args = parser.parse_args()
 
     seeds = args.seeds or [args.seed]
+    if args.output_dir is None:
+        args.output_dir = os.path.join(args.data_dir, "outputs")
+
+    global CLASS_NAMES
+    CLASS_NAMES = load_class_names(args.data_dir)
+    if not 0 <= args.class_index < len(CLASS_NAMES):
+        raise SystemExit(f"--class-index must be in [0, {len(CLASS_NAMES) - 1}] for this dataset")
 
     if args.model is None:
         model_keys = [prompt_model_choice()] if sys.stdin.isatty() else ["rf"]
@@ -587,7 +610,7 @@ def main():
 
     # Mean ± std summary over seeds for this invocation
     df = pd.DataFrame(invocation_rows)
-    headline = ["accuracy", "macro_f1", "weighted_f1", "mcc", "macro_auc", "R2L_recall", "U2R_recall"]
+    headline = ["accuracy", "macro_f1", "weighted_f1", "mcc", "macro_auc"] + [f"{c}_recall" for c in CLASS_NAMES]
     summary = df.groupby(["model", "split"])[headline].agg(["mean", "std"])
     summary.columns = [f"{m}_{s}" for m, s in summary.columns]
     summary.insert(0, "n_seeds", df.groupby(["model", "split"]).size())

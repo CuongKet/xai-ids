@@ -197,7 +197,21 @@ def preprocess_nsl_kdd(
         out_path = os.path.join(output_dir, fname)
         with open(out_path, "wb") as fp:
             pickle.dump(obj, fp)
-    print(f"Saved preprocessed datasets to {output_dir}")
+    import json
+    with open(os.path.join(output_dir, "meta.json"), "w") as fp:
+        json.dump(
+            {
+                "dataset": "NSL-KDD",
+                "class_names": CLASS_NAMES,
+                "feature_names": list(X_train.columns),
+                "oversample": oversample_mode,
+                "val_size": val_size,
+                "seed": seed,
+            },
+            fp,
+            indent=2,
+        )
+    print(f"Saved preprocessed datasets and meta.json to {output_dir}")
 
 
 if __name__ == "__main__":

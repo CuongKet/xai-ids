@@ -57,8 +57,35 @@ All SHAP values are in probability space (TreeExplainer for RandomForest, Kernel
 
 ---
 
-## 3. Additional Benchmark Suites & Datasets
+## 3. CICIDS-2017 and RoEduNet-SIMARGL2021
 
-- **`CICIDS-2017/`**: Place the 8 CSV files from the CIC-IDS-2017 *MachineLearningCVE* distribution into `cicids_db/` before running the scripts in `CICIDS-2017/`.
-- **`RoEduNet-SIMARGL2021/`**: Place the sensor CSV files into `sensor_db/` before running the scripts in `RoEduNet-SIMARGL2021/`.
-- **`Xplique/`**: Requires the external `IGTD_Functions.py` module from the [IGTD repository](https://github.com/zhuyitan/IGTD) and the `xplique` package.
+Both suites use the same runner as NSL-KDD. Each has a leak-free preprocessing script that writes
+`X/Y_{train,val,test}.pkl` and a `meta.json` (class names, feature list, settings) into `<suite>/data/<top|all>/`:
+seeded stratified train/val/test split (default 60/10/30, `--test-size` / `--val-size`), scaler and one-hot encoder fit on the
+training split only, optional training-only oversampling (`--oversample balance`; default `none`, since the models
+use balanced class weights), and `--max-rows N` for a stratified subsample when running slow models (KNN, SVM,
+KernelSHAP) on millions of rows. `top` / `all` reproduce the feature subsets of the original `*_final.py` /
+`*_all_final.py` scripts, which are kept in each suite's `legacy/` folder for reference only (see the README there for
+why their numbers should not be used).
+
+```bash
+# CICIDS-2017: 8 MachineLearningCVE CSVs in cicids_db/ (or Framework/cicids-2017/, or --raw-dir)
+.venv/bin/python CICIDS-2017/cicids_preprocessing.py --features top
+.venv/bin/python Framework/All_models.py --data-dir CICIDS-2017/data/top --model all --seeds 42 43 44 45 46 --quiet
+
+# RoEduNet-SIMARGL2021: sensor CSVs in sensor_db/ (or Framework/sigma/, or --raw-dir)
+.venv/bin/python RoEduNet-SIMARGL2021/simargl_preprocessing.py --features top
+.venv/bin/python Framework/All_models.py --data-dir RoEduNet-SIMARGL2021/data/top --model all --seeds 42 43 44 45 46 --quiet
+```
+
+- **CICIDS-2017** classes: BENIGN, DoS/DDoS (incl. Heartbleed), PortScan, Brute Force (FTP/SSH-Patator),
+  Web Attack, Bot, Infiltration. Blank rows and rows with inf/NaN features are dropped, then exact duplicates.
+- **RoEduNet-SIMARGL2021** classes: Normal, Denial of Service, Port Scanning (`--include-malware` adds the 571-row
+  malware capture). The identifier/time columns `FLOW_ID`, `TOTAL_FLOWS_EXP`, `FIRST_SWITCHED`, `LAST_SWITCHED`,
+  `L4_SRC_PORT`, `L4_DST_PORT` are excluded: each capture file holds a single class, so they identify the class.
+
+Outputs go to `<data-dir>/outputs/` with the same layout as NSL-KDD.
+
+## 4. Xplique
+
+`Xplique/` requires the external `IGTD_Functions.py` module from the [IGTD repository](https://github.com/zhuyitan/IGTD) and the `xplique` package.
